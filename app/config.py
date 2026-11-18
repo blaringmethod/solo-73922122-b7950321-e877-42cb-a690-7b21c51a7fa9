@@ -1,43 +1,27 @@
-"""Runtime configuration for the paired FASTQ service.
+"""Runtime configuration for the paired-alignment QC review service.
 
-All limits can be overridden through environment variables, but the defaults
-match the delivery requirement: each uploaded file <= 256 MiB and the whole
-process is expected to live inside a 256 MiB memory cap (see
-docker-compose.yml).
+All limits come straight from the delivery requirement and may be overridden
+through environment variables (the defaults already match the specification).
 """
 
 from __future__ import annotations
 
 import os
-from pathlib import Path
 
-MAX_FILE_BYTES = int(os.environ.get("FASTQ_MAX_FILE_BYTES", 256 * 1024 * 1024))
-"""Maximum size of a single uploaded FASTQ file (256 MiB)."""
+#: Maximum number of read pairs accepted in one request.
+MAX_PAIRS = int(os.environ.get("QC_MAX_PAIRS", 2000))
 
-DATA_DIR = Path(os.environ.get("FASTQ_DATA_DIR", "/data"))
-"""Root directory for the SQLite database and all task files."""
+#: Maximum sequence length (bases) of either mate of a pair.
+MAX_READ_LENGTH = int(os.environ.get("QC_MAX_READ_LENGTH", 500))
 
-DB_PATH = DATA_DIR / "tasks.db"
-TASKS_DIR = DATA_DIR / "tasks"
+#: Maximum number of alignment candidates supplied for one end of one read.
+MAX_CANDIDATES_PER_END = int(os.environ.get("QC_MAX_CANDIDATES_PER_END", 3))
 
-# Uploads are spooled to a temporary file once they exceed this size, so a big
-# multipart upload never accumulates in RAM.
-UPLOAD_SPOOL_THRESHOLD = int(
-    os.environ.get("FASTQ_UPLOAD_SPOOL_THRESHOLD", 1 * 1024 * 1024)
-)
+#: Minimum number of inward, single-candidate calibration pairs required.
+MIN_CALIBRATION_PAIRS = int(os.environ.get("QC_MIN_CALIBRATION_PAIRS", 20))
 
-# Records are inserted in batches; only one batch is held in memory at a time.
-INSERT_BATCH_SIZE = int(os.environ.get("FASTQ_INSERT_BATCH_SIZE", 512))
+#: Absolute slack (bases) used together with the MAD-derived span tolerance.
+SPAN_ABSOLUTE_TOLERANCE = int(os.environ.get("QC_SPAN_ABSOLUTE_TOLERANCE", 50))
 
-# SQLite page cache kept deliberately small. The heavy data stays on disk.
-SQLITE_CACHE_PAGES = int(os.environ.get("FASTQ_SQLITE_CACHE_PAGES", 2048))
-SQLITE_BUSY_TIMEOUT_MS = 30_000
-
-# How often the worker refreshes the progress percentage in the database.
-PROGRESS_UPDATE_EVERY_BYTES = 8 * 1024 * 1024
-
-STAGE_UPLOAD = "upload"
-STAGE_PARSE = "parse"
-STAGE_VALIDATE = "validate"
-STAGE_PUBLISH = "publish"
-STAGE_DONE = "done"
+#: Multiplier applied to the MAD when building the span tolerance.
+SPAN_MAD_MULTIPLIER = int(os.environ.get("QC_SPAN_MAD_MULTIPLIER", 4))

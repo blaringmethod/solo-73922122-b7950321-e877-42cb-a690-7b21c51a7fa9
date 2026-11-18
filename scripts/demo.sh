@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
-# End-to-end demo against a running service (default http://localhost:8000).
-# Shows: upload -> progress polling -> download verification, plus cancellation
-# and a rejected (malformed) upload.
+# End-to-end demo against a running QC review service (default
+# http://localhost:8000). Generates paired FASTQ + candidate JSON, then shows:
+#   1. a clean calibrated run
+#   2. cross-reference / orientation / span / undetermined anomalies
+#   3. whole-request failures (corrupted pair file, bad candidate,
+#      insufficient calibration pairs)
 set -euo pipefail
 
 BASE_URL="${BASE_URL:-http://localhost:8000}"
@@ -16,93 +19,99 @@ echo "== health =="
 curl -fsS "$BASE_URL/health"
 echo
 
-mk() { # file id seq side
-  printf '@%s/%s desc\n%s\n+\n%s\n' "$2" "$4" "$3" "$(printf '~%.0s' $(seq ${#3}))" >> "$1"
+python3 - "$WORK" <<'PY'
+import json
+import os
+import sys
+
+work = sys.argv[1]
+READ_LEN = 100
+
+def fastq(path, side, ids):
+    with open(path, "wb") as fh:
+        for rid in ids:
+            seq = (b"A" if side == 1 else b"C") * READ_LEN
+            fh.write(b"@%s/%d desc\n" % (rid.encode(), side) + seq
+                     + b"\n+\n" + b"~" * READ_LEN + b"\n")
+
+def c(rid, side, ref, start, strand="+", score=50):
+    return {"read_id": rid, "side": side, "reference": ref,
+            "start": start, "strand": strand, "score": score}
+
+# 24 clean inward calibration pairs, span 300 (R1 start 1000,
+# R2 reverse 5' end at 1200 -> rightmost base 1299).
+ids = [f"r{i:04d}" for i in range(24)]
+fastq(os.path.join(work, "R1.fastq"), 1, ids)
+fastq(os.path.join(work, "R2.fastq"), 2, ids)
+cands = []
+for rid in ids:
+    cands.append(c(rid, 1, "chr1", 1000))
+    cands.append(c(rid, 2, "chr1", 1200, "-"))
+
+# Anomalous pairs appended after the calibration set.
+extra = ["xref", "orient", "spanout", "tied"]
+fastq(os.path.join(work, "R1.fastq"), 1, ids + extra)
+fastq(os.path.join(work, "R2.fastq"), 2, ids + extra)
+cands += [
+    c("xref", 1, "chr1", 1000), c("xref", 2, "chr2", 1200, "-"),
+    c("orient", 1, "chr1", 2000, "-"), c("orient", 2, "chr1", 1000, "+"),
+    # spanout carries a low-scoring second R1 candidate so it cannot enter
+    # the single-candidate calibration set; the best combination (60+50) is
+    # inward with span 900 vs calibrated median 300 -> span anomaly.
+    c("spanout", 1, "chr1", 1000, "+", 60),
+    c("spanout", 1, "chr1", 1100, "+", 5),
+    c("spanout", 2, "chr1", 1700, "-", 50),
+    # Tied R1 choices: inward normal on chr1 vs cross-reference to chr2,
+    # equal combined score -> undetermined.
+    c("tied", 1, "chr1", 1000, "+", 25),
+    c("tied", 1, "chr2", 1000, "+", 25),
+    c("tied", 2, "chr1", 1200, "-", 25),
+]
+with open(os.path.join(work, "candidates.json"), "w") as fh:
+    json.dump({"candidates": cands}, fh)
+
+# Corrupted pair file (truncated trailing record).
+with open(os.path.join(work, "R1_bad.fastq"), "wb") as fh:
+    fh.write(open(os.path.join(work, "R1.fastq"), "rb").read())
+    fh.write(b"@tail/1\nACGT\n")
+
+# Candidate document with a non-positive start.
+bad_cands = json.loads(json.dumps(cands))
+bad_cands[0]["start"] = 0
+with open(os.path.join(work, "candidates_bad.json"), "w") as fh:
+    json.dump({"candidates": bad_cands}, fh)
+
+# Only 19 pairs -> calibration failure.
+few_ids = ids[:19]
+fastq(os.path.join(work, "few_R1.fastq"), 1, few_ids)
+fastq(os.path.join(work, "few_R2.fastq"), 2, few_ids)
+few_cands = [x for x in cands if x["read_id"] in set(few_ids)]
+with open(os.path.join(work, "few_candidates.json"), "w") as fh:
+    json.dump({"candidates": few_cands}, fh)
+PY
+
+post() { # label r1 r2 cands expected_status
+  local label="$1" r1="$2" r2="$3" cands="$4" expected="$5"
+  echo "== $label (expect HTTP $expected) =="
+  curl -s -o "$WORK/resp.json" -w 'HTTP %{http_code}\n' \
+    -X POST "$BASE_URL/qc/analyze" \
+    -F "task_id=demo-paired-task-001" \
+    -F "r1=@$r1;filename=R1.fastq" \
+    -F "r2=@$r2;filename=R2.fastq" \
+    -F "candidates=@$cands;filename=candidates.json;type=application/json"
+  python3 -m json.tool "$WORK/resp.json"
 }
 
-echo "== generating shuffled R1/R2 =="
-R1="$WORK/R1.fastq"; R2="$WORK/R2.fastq"
-for id in alpha beta gamma delta epsilon; do
-  mk "$R1" "$id" "ACGTACGTAC" 1
-done
-for id in epsilon gamma alpha delta beta; do   # deliberately shuffled
-  mk "$R2" "$id" "TGCATGCATG" 2
-done
+post "full QC run with anomalies" \
+     "$WORK/R1.fastq" "$WORK/R2.fastq" "$WORK/candidates.json" 200
 
-echo "== upload =="
-TASK=$(curl -fsS -X POST "$BASE_URL/tasks" \
-  -F "r1=@$R1;filename=R1.fastq" \
-  -F "r2=@$R2;filename=R2.fastq")
-echo "$TASK"
-ID=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])' <<<"$TASK")
+post "corrupted pair file -> whole request fails" \
+     "$WORK/R1_bad.fastq" "$WORK/R2.fastq" "$WORK/candidates.json" 400
 
-echo "== poll until terminal =="
-while :; do
-  BODY=$(curl -fsS "$BASE_URL/tasks/$ID")
-  STATUS=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["status"])' <<<"$BODY")
-  echo "$BODY"
-  case "$STATUS" in
-    succeeded|failed|cancelled) break ;;
-  esac
-  sleep 0.5
-done
+post "non-positive candidate start -> whole request fails" \
+     "$WORK/R1.fastq" "$WORK/R2.fastq" "$WORK/candidates_bad.json" 400
 
-echo "== download and verify order =="
-curl -fsS "$BASE_URL/tasks/$ID/download/r1" -o "$WORK/out_R1.fastq"
-curl -fsS "$BASE_URL/tasks/$ID/download/r2" -o "$WORK/out_R2.fastq"
-python3 - "$WORK/out_R1.fastq" "$WORK/out_R2.fastq" <<'PY'
-import sys
-ids = []
-for path in sys.argv[1:]:
-    got = []
-    with open(path, "rb") as fh:
-        while True:
-            header = fh.readline()
-            if not header:
-                break
-            got.append(header[1:].split()[0].decode().rsplit("/", 1)[0])
-            fh.readline(); fh.readline(); fh.readline()
-    ids.append(got)
-print("R1 ids:", ids[0])
-print("R2 ids:", ids[1])
-assert ids[0] == ids[1] == ["alpha", "beta", "gamma", "delta", "epsilon"]
-print("OK: paired in R1 order")
-PY
-
-echo "== malformed input is rejected as a whole task =="
-printf '@x\nACGT\n+\n~~\n' > "$WORK/bad_R2.fastq"     # seq 4 != qual 2
-BAD=$(curl -fsS -X POST "$BASE_URL/tasks" \
-  -F "r1=@$R1;filename=R1.fastq" \
-  -F "r2=@$WORK/bad_R2.fastq;filename=R2.fastq")
-BAD_ID=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])' <<<"$BAD")
-sleep 1
-curl -fsS "$BASE_URL/tasks/$BAD_ID"
-echo
-echo "(download attempt on failed task -> HTTP 409)"
-curl -s -o /dev/null -w '%{http_code}\n' "$BASE_URL/tasks/$BAD_ID/download/r1"
-
-echo "== cancellation returns immediately, task never publishes =="
-BIG_R1="$WORK/big_R1.fastq"; BIG_R2="$WORK/big_R2.fastq"
-python3 - "$BIG_R1" "$BIG_R2" <<'PY'
-import sys
-n = 200_000
-with open(sys.argv[1], "wb") as f1, open(sys.argv[2], "wb") as f2:
-    for i in range(n):
-        f1.write(b"@r%09d/1\n" % i + b"A" * 40 + b"\n+\n" + b"~" * 40 + b"\n")
-    for i in range(n - 1, -1, -1):
-        f2.write(b"@r%09d/2\n" % i + b"T" * 40 + b"\n+\n" + b"!" * 40 + b"\n")
-PY
-CANCEL=$(curl -fsS -X POST "$BASE_URL/tasks" \
-  -F "r1=@$BIG_R1;filename=big_R1.fastq" \
-  -F "r2=@$BIG_R2;filename=big_R2.fastq")
-CANCEL_ID=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])' <<<"$CANCEL")
-curl -fsS -X POST "$BASE_URL/tasks/$CANCEL_ID/cancel"
-echo
-sleep 2
-curl -fsS "$BASE_URL/tasks/$CANCEL_ID"
-echo
-
-echo "== cancelling the already succeeded task -> HTTP 409 =="
-curl -s -o /dev/null -w '%{http_code}\n' -X POST "$BASE_URL/tasks/$ID/cancel"
+post "fewer than 20 calibration pairs -> calibration failure" \
+     "$WORK/few_R1.fastq" "$WORK/few_R2.fastq" "$WORK/few_candidates.json" 400
 
 echo "ALL DEMO STEPS DONE"

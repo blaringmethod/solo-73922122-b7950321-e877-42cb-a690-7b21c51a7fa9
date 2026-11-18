@@ -1,75 +1,133 @@
-# Paired FASTQ Re-pairing Service
+# Paired-end Fragment QC Review Service
 
-测序湖入湖工具：接收顺序被打乱的双端未压缩 FASTQ（R1/R2），按读段号重新
-配对，按 R1 顺序交付两份文件，原文逐字节保留。FastAPI + SQLite 实现，单文件
-上限 256 MiB，进程内存上限 256 MiB，可处理总量超过内存的输入。
+建库质控复核服务：对一个**成功配对任务**（任务号随请求提交）的双端读对做
+异常片段复核。输入两份配对 FASTQ（R1/R2）与覆盖**全部读对**的比对候选
+JSON；服务先校准正常片段跨度，再把每对判为正常、跨参考、朝向异常、跨度
+异常或待定，输出异常读号、类别及各类计数，供结构变异复核。FastAPI 实现，
+单进程内存上限 256 MiB，无状态、不落盘、不改原件。
 
-## 配对规则
+## 输入约束
 
-- 读段号取头行首个空白前的字段，去掉开头 `@`，再去掉末尾的 `/1` 或 `/2`
-  （例如 `@read-7/1 sample=x` → `read-7`）。
-- 输出按 **R1 的原始顺序**排列；R2 按相同读段号对齐到同一位置。
-- 四行记录原文（含头行描述、换行风格）原样写入结果，不做任何改写。
+- 至多 **2000 对**；每端序列不超过 **500 碱基**。
+- 每个读段的每端至多 **3 个**候选；候选字段：
+  `read_id`、`side`（1=R1，2=R2）、`reference`（参考名称）、
+  `start`（**1 基起点**，正整数）、`strand`（`+` 正向 / `-` 反向）、
+  `score`（整数得分）。
+- 比对按**无插缺的全长比对**处理，即末端位置 = 起点 + 该端读长 − 1。
+- 候选 JSON 形状：
 
-## 失败即整次失败，不开放部分结果
+```json
+{
+  "candidates": [
+    {"read_id": "r0001", "side": 1, "reference": "chr1",
+     "start": 1000, "strand": "+", "score": 50},
+    {"read_id": "r0001", "side": 2, "reference": "chr1",
+     "start": 1200, "strand": "-", "score": 48}
+  ]
+}
+```
 
-任一情况发生，任务整体标记为 `failed`/`cancelled`，已写入的暂存全部删除，
-下载接口返回 409：
+## 校准规则
 
-- 同一文件内读段号重复（含 `/1`、`/2` 归一化后重复）
-- 孤端（某读段号只出现在一侧）
-- 格式错误：非四行式、头行不以 `@` 开头、第三行不以 `+` 开头、空文件
-- 序列与质量字符串长度不等
+仅从同时满足以下条件的「干净对子」中取样：
 
-## 内存与大输入
+1. 两端各只有 1 个候选；
+2. 两个候选位于**同一参考**；
+3. R1 为正向且在左、R2 为反向且在右（朝内：R1 `+`、R2 `-`、
+   `start_R1 < start_R2`）。
 
-- 上传经 `SpooledTemporaryFile` 落盘（超过 1 MiB 即写临时文件），分块复制，
-  单文件流式校验 256 MiB 上限，超限返回 413。
-- 解析按 512 条/批写入 SQLite（WAL、小 page cache、临时表走文件
-  `temp_store=FILE`、关闭 mmap），任意时刻内存里只有一个批次。
-- 配对发布使用 `JOIN ... ORDER BY a.ord` 流式游标，分批 `fetchmany` 写出。
-- 因此输入总量可以远超 256 MiB；自测以约 393 MiB 总量（两份各 196.5 MiB、
-  各 200 万条）验证，峰值 RSS 约 19 MiB（见下文自测结果）。
+- 干净对子 **不足 20 对 → 整次请求报校准失败**（HTTP 400，不给分类结果）。
+- 跨度定义（朝内全长比对）：
+  `span = (start_R2 + len_R2 − 1) − start_R1 + 1`。
+- 计算跨度的**中位数**与 **MAD**（中位数绝对偏差）；
+  容差 `tolerance = max(50, 4 × MAD)`。
+- 朝内对子满足 `|span − 中位数| ≤ tolerance` 判正常，否则判**跨度异常**
+  （边界等值算正常）。
 
-## 任务与取消语义
+## 分类与最高分仲裁
 
-- `POST /tasks` 上传后立即返回 `202`，后台守护线程处理。
-- `GET /tasks/{id}` 查询状态、阶段（upload/parse/validate/publish/done）与
-  0–1 进度。
-- `POST /tasks/{id}/cancel`：置取消标记后**立即返回**，不等待配对结束；
-  工作线程在下一个批次边界中止。取消与完成之间用条件 UPDATE 仲裁：
-  - 取消先到 → 任务最终 `cancelled`，结果永不发布，暂存目录删除；
-  - 完成先到 → 取消请求得到 `409`，明确告知任务已完成、不可取消，结果保留。
-- 取消后可立刻创建新任务；任务目录以 UUID 隔离，清理只删除本任务目录，
-  不会误删新任务文件。
-- 服务重启（启动钩子）：所有非终态任务标记 `failed`（原因
-  `interrupted by service restart`）并清理暂存与记录；`succeeded` 任务的
-  结果文件保留，仍可下载。
+按以下顺序给每个候选组合下结论：
+
+| 情形 | 类别 |
+| --- | --- |
+| 两端参考不同 | `cross_reference`（跨参考） |
+| 同参考但不朝内（链向或左右顺序不符） | `orientation`（朝向异常） |
+| 朝内且跨度在容差内 | `normal` |
+| 朝内但跨度超出容差 | `span`（跨度异常） |
+
+- 每对枚举 R1×R2 全部候选组合，取**两端得分之和最高**的组合。
+- 最高分并列时：仅当所有并列组合的结论（normal / cross_reference /
+  orientation / span）**完全一致**才采信该结论；否则记为
+  `undetermined`（待定）。
+
+## 整次失败，不给部分结果
+
+以下任一情况，整个请求返回错误（400/422），响应里不含任何分类结果，
+且上传原件只读、绝不改写：
+
+- 候选**漏号**（某读某端无候选）、引用了配对文件中不存在的读号、
+  同一身份候选**重复**、**起点非正**（< 1）、每端候选超过 3 个；
+- 候选 JSON 非法、字段缺失或类型错误（`side` 非 1/2、链向非 `+/-`、
+  得分非整数等）；
+- 配对 FASTQ **缺件/空文件**、非四行式、头行不以 `@` 开头、第三行不以
+  `+` 开头、序列与质量不等长、**后段截断损坏**；
+- 两侧读号集合/顺序不一致、侧内读号重复；
+- 读对数超过 2000、任一读端超过 500 碱基；
+- 校准对子不足 20。
 
 ## API
 
-| 方法 | 路径 | 说明 |
-| --- | --- | --- |
-| POST | `/tasks` | multipart 字段 `r1`、`r2`，返回任务对象（202） |
-| GET  | `/tasks/{id}` | 状态/进度/消息/下载链接 |
-| POST | `/tasks/{id}/cancel` | 请求取消（立即返回） |
-| GET  | `/tasks/{id}/download/r1` | 下载配对后的 R1 |
-| GET  | `/tasks/{id}/download/r2` | 下载配对后的 R2 |
-| GET  | `/health` | 健康检查 |
+`POST /qc/analyze`，`multipart/form-data`：
 
-启动后打开交互式文档：<http://localhost:8000/docs>，可直接在页面上演示
-上传、取消、下载全流程。
+| 字段 | 说明 |
+| --- | --- |
+| `task_id` | 成功配对任务的任务号（表单字段） |
+| `r1` | 配对后的 R1 FASTQ（未压缩） |
+| `r2` | 配对后的 R2 FASTQ（未压缩） |
+| `candidates` | 候选 JSON 文件 |
 
-## 运行（Docker Compose，内存上限 256 MiB）
+响应 `200`：
+
+```json
+{
+  "pair_count": 28,
+  "calibration": {
+    "pair_count": 24,
+    "median_span": 300.0,
+    "mad_span": 0.0,
+    "span_tolerance": 50.0
+  },
+  "counts": {
+    "normal": 24,
+    "cross_reference": 1,
+    "orientation": 1,
+    "span": 1,
+    "undetermined": 1
+  },
+  "anomalies": [
+    {"position": 25, "read_id": "xref", "category": "cross_reference"},
+    {"position": 26, "read_id": "orient", "category": "orientation"},
+    {"position": 27, "read_id": "spanout", "category": "span"},
+    {"position": 28, "read_id": "tied", "category": "undetermined"}
+  ],
+  "task_id": "demo-paired-task-001"
+}
+```
+
+错误响应（无任何部分结果）：`{"error": "...", "detail": "..."}`。
+
+另有 `GET /health` 健康检查；启动后打开交互式文档
+<http://localhost:8000/docs> 可直接在页面上提交请求。
+
+## 运行（Docker Compose）
 
 ```bash
 docker compose up --build
 # 打开 http://localhost:8000/docs
 ```
 
-`docker-compose.yml` 中 `mem_limit: 256m` 即交付要求的内存上限；数据保存在
-命名卷 `fastq-data`（容器内 `/data`，含 SQLite 与各任务目录），重启后成功
-结果仍可下载。
+`docker-compose.yml` 中 `mem_limit: 256m` 为进程内存上限；服务无状态，
+不挂载数据卷，请求处理完即释放全部资源。
 
 ## 本地直接运行（开发/自测）
 
@@ -77,53 +135,52 @@ docker compose up --build
 python3 -m venv --without-pip .venv
 .venv/bin/python tools/get-pip.py
 .venv/bin/pip install -r requirements.txt
-FASTQ_DATA_DIR=./data .venv/bin/uvicorn app.main:app --port 8000
+.venv/bin/uvicorn app.main:app --port 8000
 ```
 
 ## 演示脚本
 
 ```bash
-./scripts/demo.sh                 # 需要一个运行在 localhost:8000 的服务
+./scripts/demo.sh                              # 需要服务运行在 localhost:8000
 BASE_URL=http://localhost:8000 ./scripts/demo.sh
 ```
 
-脚本会生成一对乱序 FASTQ，演示上传 → 轮询进度 → 下载校验，并额外演示一次
-取消与一次错误输入。
+脚本自动生成配对 FASTQ 与候选文件，演示一次含四类异常的完整分析，以及
+配对文件损坏、起点非正、校准不足三种整次失败。
 
 ## 自测
 
 ```bash
-# 短测试（功能/取消/重启语义 + 取消与完成的仲裁），共 39 项检查
 bash scripts/run_tests.sh
-# 或分别运行
-.venv/bin/python -I tests/test_api.py          # 30 项：配对、整次失败、取消、重启恢复
-.venv/bin/python -I tests/test_cancel_race.py  # 9 项：取消/完成条件 UPDATE 仲裁
-
-# 内存压力测试：两份各 196.5 MiB（合计约 393 MiB，超过 256 MiB 内存上限），
-# 子进程实测峰值 RSS 约 19 MiB，并逐条校验配对顺序与原文
-.venv/bin/python -I tests/test_memory.py 2000000
+# 或
+.venv/bin/python -I tests/test_qc.py
 ```
+
+共 **60 项检查**，覆盖：中位数/MAD/容差校准与 20 对下限、跨度边界判定、
+跨参考/朝向/跨度分类、最高分仲裁、并列一致采信与冲突待定、全部输入校验
+错误、2000 对/500 碱基/3 候选上限、FASTQ 解析与配对校验，以及 HTTP 全链路
+（200/400/422、错误信封无部分结果、`/health`、`/docs`、OpenAPI 注册）。
 
 ## 目录结构
 
 ```
 app/
-  config.py    # 上限、路径、批大小等配置（环境变量可覆盖）
-  db.py        # SQLite schema 与任务/记录访问
-  fastq.py     # 流式解析、校验、JOIN 配对发布
-  worker.py    # 后台线程、取消仲裁、启动恢复、任务目录清理
-  main.py      # FastAPI 路由与有界流式上传
-tests/         # 功能自测与内存压力测试
-scripts/demo.sh
+  config.py    # 2000 对 / 500 碱基 / 3 候选 / 20 校准对等上限（环境变量可覆盖）
+  fastq.py     # FASTQ 解析、四行式校验、双端配对校验（只读原件）
+  qc.py        # 候选解析与校验、校准、最高分仲裁、分类（纯逻辑）
+  main.py      # FastAPI 路由、统一错误信封、有界上传
+tests/test_qc.py
+scripts/demo.sh, scripts/run_tests.sh
 Dockerfile, docker-compose.yml, requirements.txt
 ```
 
-## 遗留项 / 边界说明
+## 边界说明 / 遗留项
 
 - 仅接受未压缩 FASTQ；`.gz` 等压缩格式不在范围内。
-- 服务为单实例 + 单 SQLite 文件设计；多实例横向扩展需要换用共享存储/队列。
-- 没有内置任务 TTL 清理，成功结果会一直保留在数据卷中，需外部运维定期清理。
-- 开发沙箱内未安装 Docker，`docker compose up` 未实跑；compose/Dockerfile 仅做
-  了 YAML 与结构校验，应用本身已用等价的本地 uvicorn 命令完整验证（含
-  `/docs`、上传、取消、下载、重启恢复）。在装有 Docker 的环境执行
-  `docker compose up --build` 即可，`mem_limit: 256m` 即内存上限。
+- 比对固定按无插缺全长比对处理，不接受 CIGAR；片段跨度即两端比对覆盖的
+  参考碱基数。
+- 服务无持久化设计，请求结果不保存；如需留存复核结论，由调用方自行归档。
+- 开发沙箱内未安装 Docker，`docker compose up` 未实跑；compose/Dockerfile
+  仅做了 YAML 与结构校验，应用本身已用等价的本地 uvicorn 命令完整验证
+  （含 `/docs`、200/400/422 全部分支）。在装有 Docker 的环境执行
+  `docker compose up --build` 即可。

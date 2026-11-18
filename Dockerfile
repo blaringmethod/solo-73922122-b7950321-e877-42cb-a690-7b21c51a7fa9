@@ -2,8 +2,7 @@ FROM python:3.12-slim
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    PIP_NO_CACHE_DIR=1 \
-    FASTQ_DATA_DIR=/data
+    PIP_NO_CACHE_DIR=1
 
 WORKDIR /srv
 
@@ -12,8 +11,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app /srv/app
 
-RUN mkdir -p /data && useradd --create-home --uid 10001 appuser \
-    && chown -R appuser:appuser /data /srv
+RUN useradd --create-home --uid 10001 appuser \
+    && chown -R appuser:appuser /srv
 USER appuser
 
 EXPOSE 8000

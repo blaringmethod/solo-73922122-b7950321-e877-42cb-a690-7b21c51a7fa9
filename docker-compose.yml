@@ -1,19 +1,16 @@
 services:
-  fastq-pairer:
+  qc-review:
     build: .
-    image: fastq-pairer:1.0.0
+    image: pe-fragment-qc:1.0.0
     ports:
       - "8000:8000"
     environment:
-      # Single-file upload cap (bytes); also documented in the API.
-      FASTQ_MAX_FILE_BYTES: "268435456"
-      FASTQ_DATA_DIR: "/data"
-      # Keep the SQLite page cache and Python-side batches small so the whole
-      # process stays within the 256 MiB memory limit.
-      FASTQ_SQLITE_CACHE_PAGES: "2048"
-      FASTQ_INSERT_BATCH_SIZE: "512"
-    volumes:
-      - fastq-data:/data
+      # Request caps from the delivery specification (defaults in app/config.py
+      # already match; exposed here for operational overrides).
+      QC_MAX_PAIRS: "2000"
+      QC_MAX_READ_LENGTH: "500"
+      QC_MAX_CANDIDATES_PER_END: "3"
+      QC_MIN_CALIBRATION_PAIRS: "20"
     mem_limit: 256m
     mem_reservation: 128m
     restart: unless-stopped
@@ -22,6 +19,3 @@ services:
       interval: 15s
       timeout: 5s
       retries: 3
-
-volumes:
-  fastq-data:

@@ -1,27 +1,26 @@
-"""Streaming FASTQ parsing, validation and paired publishing.
+"""FASTQ parsing and pair-file validation.
 
-Everything here works in fixed-size batches and streams from disk through
-SQLite, so the total input size is allowed to exceed the process memory cap.
-The original four lines of every record are stored byte-for-byte and written
-out unchanged.
+A request is capped at 2000 pairs with at most 500 bases per mate, so the
+whole payload is small; records are parsed into memory. The parser only ever
+reads the uploaded bytes, never writes to or rewrites the original files.
 """
 
 from __future__ import annotations
 
-import os
-import sqlite3
-from collections.abc import Callable, Iterator
-from pathlib import Path
-
-from . import config, db
+from collections.abc import Iterator
+from dataclasses import dataclass
 
 
 class FastqFormatError(ValueError):
     """Raised when a FASTQ file violates the four-line record contract."""
 
 
-class TaskCancelled(Exception):
-    """Raised internally when a worker observes its cancellation flag."""
+@dataclass(frozen=True)
+class FastqRecord:
+    """One parsed FASTQ record: canonical read id plus the raw sequence."""
+
+    read_id: str
+    sequence: bytes
 
 
 def extract_read_id(header_line: bytes) -> str:
@@ -47,223 +46,86 @@ def extract_read_id(header_line: bytes) -> str:
     return first_field.decode("latin-1")
 
 
-def _iter_raw_records(path: Path, side_label: str) -> Iterator[tuple[bytes, bytes, bytes, bytes]]:
-    with path.open("rb") as fh:
-        record_no = 0
-        while True:
-            lines = [fh.readline(), fh.readline(), fh.readline(), fh.readline()]
-            if not lines[0]:
-                # EOF: the other three must be empty too.
-                if any(lines[1:]):
-                    raise FastqFormatError(
-                        f"{side_label}: truncated final record (expected four lines)"
-                    )
-                if record_no == 0:
-                    raise FastqFormatError(f"{side_label}: file contains no records")
-                return
-            record_no += 1
-            if any(not line for line in lines):
-                raise FastqFormatError(
-                    f"{side_label}: record {record_no} is missing lines "
-                    "(FASTQ records must span exactly four lines)"
-                )
-            header, sequence, plus, quality = lines
-            if not header.startswith(b"@"):
-                raise FastqFormatError(
-                    f"{side_label}: record {record_no} header does not start with '@'"
-                )
-            if not plus.startswith(b"+"):
-                raise FastqFormatError(
-                    f"{side_label}: record {record_no} third line does not start with '+'"
-                )
-            seq = sequence.rstrip(b"\r\n")
-            qual = quality.rstrip(b"\r\n")
-            if not seq:
-                raise FastqFormatError(
-                    f"{side_label}: record {record_no} has an empty sequence"
-                )
-            if not qual:
-                raise FastqFormatError(
-                    f"{side_label}: record {record_no} has an empty quality string"
-                )
-            if len(seq) != len(qual):
-                raise FastqFormatError(
-                    f"{side_label}: record {record_no} sequence length {len(seq)} "
-                    f"!= quality length {len(qual)}"
-                )
-            yield header, sequence, plus, quality
-
-
-def parse_file(
-    conn: sqlite3.Connection,
-    task_id: str,
-    path: Path,
-    side: int,
-    is_cancelled: Callable[[], bool],
-    progress_cb: Callable[[int], None],
-) -> int:
-    """Parse one FASTQ file into the records table in fixed-size batches.
-
-    Returns the number of records parsed. Raises FastqFormatError on any
-    malformed record and TaskCancelled on cancellation.
-    """
-    side_label = f"R{side}"
-    batch: list[tuple] = []
-    seen_in_batch: set[str] = set()
-    ordinal = 0
-
-    def flush() -> None:
-        if not batch:
-            return
-        ids = [row[1] for row in batch]
-        existing = conn.execute(
-            f"SELECT read_id FROM records WHERE task_id = ? AND side = ? "
-            f"AND read_id IN ({','.join('?' * len(ids))}) LIMIT 1",
-            (task_id, side, *ids),
-        ).fetchone()
-        if existing is not None:
+def _iter_records(data: bytes, side_label: str) -> Iterator[FastqRecord]:
+    if not data:
+        raise FastqFormatError(f"{side_label}: file is empty")
+    # splitlines() treats a final newline correctly and rejects a stray
+    # trailing segment because the total line count must be divisible by 4.
+    lines = data.splitlines()
+    if len(lines) % 4 != 0:
+        raise FastqFormatError(
+            f"{side_label}: truncated trailing record (expected four lines per "
+            f"record, found {len(lines) % 4} trailing line(s))"
+        )
+    record_no = 0
+    for i in range(0, len(lines), 4):
+        record_no += 1
+        header, sequence, plus, quality = lines[i : i + 4]
+        if not header.startswith(b"@"):
             raise FastqFormatError(
-                f"{side_label}: duplicate read id '{existing['read_id']}'"
+                f"{side_label}: record {record_no} header does not start with '@'"
             )
-        conn.execute("BEGIN IMMEDIATE")
-        try:
-            db.insert_records(conn, task_id, batch)
-            conn.execute("COMMIT")
-        except sqlite3.IntegrityError as exc:
-            # Belt-and-braces: the unique index must never see a duplicate.
-            if conn.in_transaction:
-                conn.execute("ROLLBACK")
-            raise FastqFormatError(f"{side_label}: duplicate read id ({exc})") from exc
-        except sqlite3.Error:
-            if conn.in_transaction:
-                conn.execute("ROLLBACK")
-            raise
-        batch.clear()
-        seen_in_batch.clear()
-
-    bytes_read = 0
-    last_progress = 0
-    for header, sequence, plus, quality in _iter_raw_records(path, side_label):
-        if is_cancelled():
-            raise TaskCancelled()
-        read_id = extract_read_id(header.rstrip(b"\r\n"))
-        if read_id in seen_in_batch:
-            raise FastqFormatError(f"{side_label}: duplicate read id '{read_id}'")
-        seen_in_batch.add(read_id)
-        data = b"".join((header, sequence, plus, quality))
-        bytes_read += len(data)
-        batch.append((side, ordinal, read_id, data))
-        ordinal += 1
-        if len(batch) >= config.INSERT_BATCH_SIZE:
-            flush()
-        if bytes_read - last_progress >= config.PROGRESS_UPDATE_EVERY_BYTES:
-            progress_cb(bytes_read)
-            last_progress = bytes_read
-    flush()
-    progress_cb(bytes_read)
-    if ordinal == 0:
-        raise FastqFormatError(f"{side_label}: file contains no records")
-    return ordinal
+        if not plus.startswith(b"+"):
+            raise FastqFormatError(
+                f"{side_label}: record {record_no} third line does not start with '+'"
+            )
+        if not sequence:
+            raise FastqFormatError(
+                f"{side_label}: record {record_no} has an empty sequence"
+            )
+        if not quality:
+            raise FastqFormatError(
+                f"{side_label}: record {record_no} has an empty quality string"
+            )
+        if len(sequence) != len(quality):
+            raise FastqFormatError(
+                f"{side_label}: record {record_no} sequence length {len(sequence)} "
+                f"!= quality length {len(quality)}"
+            )
+        yield FastqRecord(extract_read_id(header), sequence)
 
 
-def validate_pairing(conn: sqlite3.Connection, task_id: str) -> None:
-    """Fail the whole task if any read id lacks its mate on the other side."""
-    orphan_r1 = conn.execute(
-        "SELECT a.read_id AS rid FROM records a "
-        "WHERE a.task_id = ? AND a.side = 1 AND NOT EXISTS ("
-        "  SELECT 1 FROM records b WHERE b.task_id = a.task_id "
-        "  AND b.side = 2 AND b.read_id = a.read_id) LIMIT 1",
-        (task_id,),
-    ).fetchone()
-    if orphan_r1 is not None:
-        raise FastqFormatError(
-            f"orphan R1 read without an R2 mate: '{orphan_r1['rid']}'"
-        )
-    orphan_r2 = conn.execute(
-        "SELECT a.read_id AS rid FROM records a "
-        "WHERE a.task_id = ? AND a.side = 2 AND NOT EXISTS ("
-        "  SELECT 1 FROM records b WHERE b.task_id = a.task_id "
-        "  AND b.side = 1 AND b.read_id = a.read_id) LIMIT 1",
-        (task_id,),
-    ).fetchone()
-    if orphan_r2 is not None:
-        raise FastqFormatError(
-            f"orphan R2 read without an R1 mate: '{orphan_r2['rid']}'"
-        )
+def parse_fastq(data: bytes, side: int) -> list[FastqRecord]:
+    """Parse one FASTQ byte string into ordered records."""
+    return list(_iter_records(data, f"R{side}"))
 
 
-def publish(
-    conn: sqlite3.Connection,
-    task_id: str,
-    out_dir: Path,
-    is_cancelled: Callable[[], bool],
-    progress_cb: Callable[[float], None],
-) -> tuple[str, str]:
-    """Stream joined pairs to two temporary files in R1 ordinal order.
+def validate_paired_files(
+    r1_records: list[FastqRecord], r2_records: list[FastqRecord]
+) -> list[tuple[str, int, int]]:
+    """Validate the two pair files and return ``(id, len_R1, len_R2)`` pairs.
 
-    Only complete temporary files are produced here; the caller performs the
-    final status arbitration and the atomic rename, so a cancelled task can
-    never publish result files. Returns the temporary file names.
+    Both files must contain the same read ids, each exactly once per side, in
+    the same order (the re-pairing task upstream already aligns them). Any
+    violation fails the whole request.
     """
-    total = conn.execute(
-        "SELECT COUNT(*) AS n FROM records WHERE task_id = ? AND side = 1",
-        (task_id,),
-    ).fetchone()["n"]
-    if total == 0:
-        raise FastqFormatError("no R1 records to publish")
+    r1_ids = [r.read_id for r in r1_records]
+    r2_ids = [r.read_id for r in r2_records]
 
-    out_dir.mkdir(parents=True, exist_ok=True)
-    tmp_r1 = out_dir / ".R1.fastq.tmp"
-    tmp_r2 = out_dir / ".R2.fastq.tmp"
+    seen: set[str] = set()
+    for rid in r1_ids:
+        if rid in seen:
+            raise FastqFormatError(f"R1: duplicate read id '{rid}'")
+        seen.add(rid)
+    seen.clear()
+    for rid in r2_ids:
+        if rid in seen:
+            raise FastqFormatError(f"R2: duplicate read id '{rid}'")
+        seen.add(rid)
 
-    cursor = conn.execute(
-        "SELECT a.data AS d1, b.data AS d2 "
-        "FROM records a JOIN records b "
-        "  ON b.task_id = a.task_id AND b.side = 2 AND b.read_id = a.read_id "
-        "WHERE a.task_id = ? AND a.side = 1 "
-        "ORDER BY a.ord",
-        (task_id,),
-    )
-    written = 0
-    try:
-        with tmp_r1.open("wb") as f1, tmp_r2.open("wb") as f2:
-            while True:
-                if is_cancelled():
-                    raise TaskCancelled()
-                rows = cursor.fetchmany(config.INSERT_BATCH_SIZE)
-                if not rows:
-                    break
-                f1.write(b"".join(row["d1"] for row in rows))
-                f2.write(b"".join(row["d2"] for row in rows))
-                written += len(rows)
-                progress_cb(written / total)
-            f1.flush()
-            f2.flush()
-            os.fsync(f1.fileno())
-            os.fsync(f2.fileno())
-        if is_cancelled():
-            raise TaskCancelled()
-    except BaseException:
-        for tmp in (tmp_r1, tmp_r2):
-            try:
-                tmp.unlink(missing_ok=True)
-            except OSError:
-                pass
-        raise
-    if written != total:
-        for tmp in (tmp_r1, tmp_r2):
-            try:
-                tmp.unlink(missing_ok=True)
-            except OSError:
-                pass
-        raise FastqFormatError(f"published {written} pairs but expected {total}")
-    return tmp_r1.name, tmp_r2.name
-
-
-def promote_results(out_dir: Path, tmp1_name: str, tmp2_name: str) -> tuple[str, str]:
-    """Atomically rename complete temp files into the published result names."""
-    final_r1 = out_dir / "R1.fastq"
-    final_r2 = out_dir / "R2.fastq"
-    os.replace(out_dir / tmp1_name, final_r1)
-    os.replace(out_dir / tmp2_name, final_r2)
-    return final_r1.name, final_r2.name
+    if len(r1_ids) != len(r2_ids):
+        raise FastqFormatError(
+            f"pair files hold different numbers of records: R1={len(r1_ids)}, "
+            f"R2={len(r2_ids)}"
+        )
+    pairs: list[tuple[str, int, int]] = []
+    for idx, (rec1, rec2) in enumerate(zip(r1_records, r2_records), start=1):
+        if rec1.read_id != rec2.read_id:
+            raise FastqFormatError(
+                f"pair position {idx}: R1 id '{rec1.read_id}' does not match "
+                f"R2 id '{rec2.read_id}'"
+            )
+        pairs.append((rec1.read_id, len(rec1.sequence), len(rec2.sequence)))
+    if not pairs:
+        raise FastqFormatError("pair files contain no records")
+    return pairs
